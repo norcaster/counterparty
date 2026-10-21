@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "norcaster-counterparty"
+version = "0.1.0"
+description = "Self-hosted Shared Record counterparty: your own keys and records, receipts and acknowledgements for agent tool calls exchanged with a partner, log witnessing and evidence export. No Norcaster account needed."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Norcaster (Navego AB)", email = "security@norcaster.com" }]
+keywords = ["shared-record", "scitt", "agents", "mcp", "evidence", "verification", "ai-governance"]
+dependencies = ["norcaster-verify[signatures]>=0.4.0"]
+
+[project.optional-dependencies]
+# Receiving side: add Shared Record to your MCP server (MCP Python SDK 1.x or 2.x; tested 1.22, 1.30, 2.3;
+# 1.19-1.21 do not import with current pydantic).
+mcp = ["mcp>=1.22.0,<3"]
+# Sending side: your OpenAI Agents SDK agent calls a partner's MCP tools (tested 0.24.0; pre-1.0, so pinned
+# to the minor version). It brings the MCP SDK, so it covers the receiving side too.
+openai-agents = ["openai-agents>=0.24.0,<0.25", "mcp>=1.22.0,<3"]
+# Claude Agent SDK / Claude Code adapter for the local proxy (norcaster_counterparty.hooks.claude; tested 0.2.168).
+# The proxy itself needs only the mcp extra; the adapter's command hook needs no extra at all.
+claude-agent-sdk = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.23.0,<3"]
+# Google ADK adapter for the local proxy (norcaster_counterparty.hooks.google_adk; tested 2.12.0 on MCP SDK 1.24-2.3).
+# ADK needs Python 3.11 or later.
+google-adk = ["google-adk[mcp]>=2.12.0,<2.13; python_version >= '3.11'", "mcp>=1.24.0,<3"]
+# LangGraph adapter for the local proxy (norcaster_counterparty.hooks.langgraph; tested langchain-mcp-adapters 0.3.2
+# with LangGraph 1.2). langchain-mcp-adapters needs the MCP Python SDK 1.x.
+langgraph = ["langchain-mcp-adapters>=0.3.2,<0.4", "mcp>=1.24.0,<2"]
+
+[project.urls]
+Homepage = "https://www.norcaster.com"
+
+[project.scripts]
+norcaster-counterparty = "norcaster_counterparty.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["test"]

@@ -1,0 +1,4 @@
+# What the image installs besides the component itself (docker/lock.sh writes requirements.txt).
+norcaster-verify[signatures]==0.4.0
+# The local MCP proxy (norcaster-counterparty proxy serve | stdio): the MCP Python SDK, exactly pinned.
+mcp==2.3.0

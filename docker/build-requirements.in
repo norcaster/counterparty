@@ -1,0 +1,2 @@
+# The build backend for the image's first stage (docker/lock.sh writes build-requirements.txt).
+hatchling

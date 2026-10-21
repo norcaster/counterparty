@@ -1,0 +1,189 @@
+# Cut a release by pushing a version tag (v0.1.0). Nothing is stored in this repository but the
+# release key's PUBLIC half (cosign.pub).
+#   PyPI: pending publisher for project "norcaster-counterparty": owner norcaster, repo counterparty,
+#         workflow release.yml, environment pypi (trusted publishing, no token).
+#   Image: ghcr.io/norcaster/counterparty, built with BuildKit's SBOM and SLSA provenance, a CycloneDX
+#         SBOM attested, and signed with Norcaster's RELEASE key: repository secrets
+#         COSIGN_RELEASE_KEY (the private key cosign generate-key-pair wrote) and
+#         COSIGN_RELEASE_PASSWORD. Never the licence key or any other key: the release key signs
+#         release artifacts and nothing else. Without the secret the image job fails before it pushes.
+#   Transparency log: every signature and attestation also goes to the public Sigstore log (Rekor),
+#         decided 18 Oct 2026 (plan §12.4 O3). Setting the repository variable COSIGN_TLOG_UPLOAD
+#         to "false" turns that off; verify such a release with --insecure-ignore-tlog=true.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  # cosign is installed checksum-pinned, as in Norcaster's own image workflows. Moving to cosign 3
+  # needs --use-signing-config=false next to --tlog-upload=false (v3 refuses the pair otherwise).
+  # The image job builds only once norcaster-verify's release is on PyPI (docker/requirements.txt).
+  COSIGN_VERSION: 2.6.5
+  COSIGN_SHA256: c3b4f5410e608af03a5eb0aaac84a4313d8da131248e08ff1759ac70c79d1644
+
+jobs:
+  check-version:
+    name: Tag matches package versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744
+      - run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PY=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          INIT=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/norcaster_counterparty/__init__.py)
+          LOG=$(sed -n 's/^## \([0-9][^ ]*\).*/\1/p' CHANGELOG.md | head -1)
+          echo "tag=$TAG pyproject=$PY __init__=$INIT changelog=$LOG"
+          [ "$TAG" = "$PY" ] && [ "$TAG" = "$INIT" ] && [ "$TAG" = "$LOG" ] || { echo "version mismatch"; exit 1; }
+
+  pypi:
+    name: Publish norcaster-counterparty to PyPI
+    needs: check-version
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        with:
+          python-version: "3.12"
+      - name: Build and test the artifacts that will be published
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*
+          python -m pip install pytest "$(ls dist/*.whl)"
+          pytest -q
+      - name: Publish (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+
+  image:
+    name: Build, attest and sign ghcr.io/norcaster/counterparty
+    needs: check-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/counterparty
+      HAS_RELEASE_KEY: ${{ secrets.COSIGN_RELEASE_KEY != '' }}
+      TLOG: ${{ vars.COSIGN_TLOG_UPLOAD != 'false' }}
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744
+
+      - name: The release key is configured (nothing is pushed unsigned)
+        run: |
+          [ "$HAS_RELEASE_KEY" = "true" ] || { echo "add the COSIGN_RELEASE_KEY and COSIGN_RELEASE_PASSWORD secrets"; exit 1; }
+          [ -f cosign.pub ] || { echo "commit the release key's public half as cosign.pub"; exit 1; }
+
+      - name: Install cosign (checksum-pinned)
+        run: |
+          set -euo pipefail
+          curl -fsSLo cosign "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  cosign" | sha256sum -c -
+          sudo install -m 0755 cosign /usr/local/bin/cosign
+
+      - name: The secret is the key cosign.pub names
+        env:
+          COSIGN_RELEASE_KEY: ${{ secrets.COSIGN_RELEASE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_RELEASE_PASSWORD }}
+        run: |
+          cosign public-key --key env://COSIGN_RELEASE_KEY > "$RUNNER_TEMP/derived.pub"
+          diff <(openssl pkey -pubin -in cosign.pub -outform DER | sha256sum) \
+               <(openssl pkey -pubin -in "$RUNNER_TEMP/derived.pub" -outform DER | sha256sum) \
+            || { echo "COSIGN_RELEASE_KEY does not match cosign.pub"; exit 1; }
+
+      - uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5
+
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build for the scan
+        uses: docker/build-push-action@ca877d9245402d1537745e0e356eab47c3520991  # v6.13.0
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          tags: scan/counterparty:${{ steps.version.outputs.version }}
+          build-args: NORCASTER_VERSION=${{ steps.version.outputs.version }}
+
+      - name: No fixable critical CVE
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.74.0 image --quiet \
+            --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 \
+            "scan/counterparty:${{ steps.version.outputs.version }}"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@ca877d9245402d1537745e0e356eab47c3520991  # v6.13.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          build-args: NORCASTER_VERSION=${{ steps.version.outputs.version }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          # BuildKit's SPDX SBOM and SLSA provenance, attached to the image index.
+          sbom: true
+          provenance: mode=max
+
+      - name: Sign with the release key
+        env:
+          COSIGN_RELEASE_KEY: ${{ secrets.COSIGN_RELEASE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_RELEASE_PASSWORD }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes --key env://COSIGN_RELEASE_KEY --tlog-upload="$TLOG" "${IMAGE}@${DIGEST}"
+
+      - name: CycloneDX SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c  # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom-counterparty.cdx.json
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest the CycloneDX SBOM with the release key
+        env:
+          COSIGN_RELEASE_KEY: ${{ secrets.COSIGN_RELEASE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_RELEASE_PASSWORD }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign attest --yes --key env://COSIGN_RELEASE_KEY --tlog-upload="$TLOG" --type cyclonedx \
+            --predicate sbom-counterparty.cdx.json "${IMAGE}@${DIGEST}"
+
+      - name: Verify what was published (fail closed)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          IGNORE=$([ "$TLOG" = "true" ] && echo "" || echo "--insecure-ignore-tlog=true")
+          cosign verify --key cosign.pub $IGNORE "${IMAGE}@${DIGEST}" > /dev/null
+          cosign verify-attestation --key cosign.pub $IGNORE --type cyclonedx "${IMAGE}@${DIGEST}" > /dev/null
+          echo "${IMAGE}@${DIGEST}" | tee digest.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: release-counterparty
+          path: |
+            sbom-counterparty.cdx.json
+            digest.txt
+          if-no-files-found: error
